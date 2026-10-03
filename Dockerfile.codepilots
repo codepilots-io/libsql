@@ -1,0 +1,32 @@
+# libsql-server (sqld) with the fixes on this branch (see CHANGELOG.md).
+# Same layout as the upstream image (entrypoint scripts, gosu, sqld user,
+# volume, ports), but on Debian bookworm: bullseye's security archive now
+# 404s, so bullseye images can no longer install build dependencies.
+# sqld only links glibc and libgcc_s.
+FROM rust:slim-bookworm AS builder
+RUN apt-get update \
+    && apt-get install -y libclang-dev clang build-essential tcl protobuf-compiler file \
+        libssl-dev pkg-config git cmake \
+    && rm -rf /var/lib/apt/lists/*
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN tc=$(grep channel rust-toolchain.toml | awk '{print $3}' | tr -d '"') \
+    && rustup update "$tc" && rustup default "$tc" && rm rust-toolchain.toml
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/cargo-target \
+    CARGO_TARGET_DIR=/cargo-target cargo build -p libsql-server --release --locked \
+    && cp /cargo-target/release/sqld /sqld
+
+FROM ghcr.io/tursodatabase/libsql-server@sha256:bc100873a74865392a49191b4733025fe8222a409799efa424dc196feaf05035 AS upstream
+
+FROM debian:bookworm-slim
+EXPOSE 5001 8080
+VOLUME [ "/var/lib/sqld" ]
+RUN groupadd --system --gid 666 sqld \
+    && adduser --system --home /var/lib/sqld --uid 666 --gid 666 sqld
+WORKDIR /var/lib/sqld
+COPY --from=upstream /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-wrapper.sh /usr/local/bin/gosu /usr/local/bin/
+COPY --from=upstream /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /sqld /bin/sqld
+ENTRYPOINT ["/usr/local/bin/docker-wrapper.sh"]
+CMD ["/bin/sqld"]
