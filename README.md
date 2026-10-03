@@ -1,5 +1,15 @@
 <!-- markdownlint-disable MD033 MD041 -->
 
+> **This is the [codepilots-io](https://github.com/codepilots-io) fork of libSQL.**
+> It carries fixes to the libsql-server (sqld) write-lock scheduler that can
+> otherwise stall all writes, abort the server, or deadlock under concurrent
+> writes. Everything else is upstream, unchanged. See [CHANGELOG.md](CHANGELOG.md)
+> for the fixes and how they were verified.
+>
+> Image: `ghcr.io/codepilots-io/libsql-server` (drop-in for
+> `ghcr.io/tursodatabase/libsql-server`) · Branch: `codepilots` ·
+> Upstream: [tursodatabase/libsql](https://github.com/tursodatabase/libsql)
+
 <p align="center">
   <a href="https://turso.tech/libsql">
     <img alt="libSQL by Turso" src="https://github.com/tursodatabase/libsql/assets/950181/6c8679e7-65a9-4777-b08a-2ddf4321160f" width="1000">
