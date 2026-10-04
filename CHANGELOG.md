@@ -1,10 +1,12 @@
 # Changelog — codepilots-io/libsql
 
 This fork tracks [tursodatabase/libsql](https://github.com/tursodatabase/libsql)
-and carries fixes to **libsql-server (sqld)** that are not upstream. Versions
-are `<upstream sqld version>-codepilots.<n>`.
+and carries fixes to **libsql-server (sqld)** that are not upstream. Releases
+use the upstream sqld version they are based on; the image name
+(`ghcr.io/codepilots-io/libsql-server`) tells them apart from upstream's
+builds. A further fix on the same upstream base gets the next patch version.
 
-## 0.24.33-codepilots.1 — 2026-10-03
+## 0.24.33 — 2026-10-04
 
 Based on upstream `f8fb14f3` (sqld 0.24.33, the source of
 `ghcr.io/tursodatabase/libsql-server:latest` as of August 2026). All code
@@ -50,7 +52,7 @@ write-lock scheduler that serialises writers across connections.
 - `Dockerfile.codepilots` builds on Debian bookworm with the upstream image
   layout (entrypoint, `gosu`, `sqld` user, volume, ports). Upstream's bullseye
   images no longer build because bullseye's security archive returns 404.
-- Image: `ghcr.io/codepilots-io/libsql-server:0.24.33-codepilots.1` (linux/amd64).
+- Image: `ghcr.io/codepilots-io/libsql-server:0.24.33` (linux/amd64).
 
 ### Verification
 

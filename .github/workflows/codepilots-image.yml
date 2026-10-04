@@ -3,7 +3,7 @@ name: Build libsql-server image
 on:
   push:
     branches: [codepilots]
-    tags: ["v*-codepilots.*"]
+    tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
