@@ -18,6 +18,44 @@ use super::TXN_TIMEOUT;
 pub type ConnId = u64;
 pub type InnerWalManager = Sqlite3WalManager;
 
+/// Upper bound on how long `acquire` waits for the write lock before giving up
+/// with `SQLITE_BUSY`, from `SQLD_WRITE_LOCK_MAX_WAIT_MS` (unset or 0: wait
+/// forever, the upstream behaviour). Under sustained overload the queue keeps
+/// requests whose clients have long since given up; without a bound it, and
+/// the threads parked in it, grow without limit.
+fn write_lock_max_wait() -> Option<Duration> {
+    static MAX_WAIT: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *MAX_WAIT.get_or_init(|| {
+        let ms = std::env::var("SQLD_WRITE_LOCK_MAX_WAIT_MS")
+            .ok()?
+            .parse::<u64>()
+            .map_err(|e| tracing::error!("ignoring invalid SQLD_WRITE_LOCK_MAX_WAIT_MS: {e}"))
+            .ok()?;
+        (ms > 0).then(|| Duration::from_millis(ms))
+    })
+}
+
+/// Rate-limited warning for waiters that gave up: under overload there can be
+/// thousands a second.
+fn warn_gave_up(waited: Duration) {
+    static GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_WARN_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = GAVE_UP.fetch_add(1, Ordering::Relaxed) + 1;
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = LAST_WARN_S.load(Ordering::Relaxed);
+    if now_s >= last + 10
+        && LAST_WARN_S
+            .compare_exchange(last, now_s, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            "write lock not acquired within {waited:?}, returning SQLITE_BUSY ({n} waiters gave up since start)"
+        );
+    }
+}
+
 pub type InnerWal = Sqlite3Wal;
 pub type ManagedConnectionWal = WrappedWal<ManagedConnectionWalWrapper, InnerWal>;
 
@@ -120,6 +158,8 @@ pub struct ConnectionManagerInner {
     acquire_timeout_duration: Duration,
     next_conn_id: AtomicU64,
     sync_token: AtomicU64,
+    /// See [`write_lock_max_wait`].
+    write_lock_max_wait: Option<Duration>,
 }
 
 impl Default for ConnectionManagerInner {
@@ -132,6 +172,7 @@ impl Default for ConnectionManagerInner {
             acquire_timeout_duration: Duration::from_millis(15),
             next_conn_id: Default::default(),
             sync_token: AtomicU64::new(0),
+            write_lock_max_wait: write_lock_max_wait(),
         }
     }
 }
@@ -140,6 +181,14 @@ impl Default for ConnectionManagerInner {
 pub struct ManagedConnectionWalWrapper {
     id: ConnId,
     manager: ConnectionManager,
+}
+
+/// `Parker::park`, but bounded by the give-up deadline when there is one.
+fn park_until(parker: &Parker, give_up_at: Option<Instant>) {
+    match give_up_at {
+        Some(deadline) => parker.park_deadline(deadline),
+        None => parker.park(),
+    }
 }
 
 impl ManagedConnectionWalWrapper {
@@ -158,6 +207,9 @@ impl ManagedConnectionWalWrapper {
         let mut warned_stale_slot = false;
         let mut enqueued = false;
         let enqueued_at = Instant::now();
+        let give_up_at = self.manager.write_lock_max_wait.map(|d| enqueued_at + d);
+        // Every park is capped at the give-up deadline so a waiter notices it.
+        let cap = |deadline: Instant| give_up_at.map_or(deadline, |g| deadline.min(g));
         let sync_token = self.manager.sync_token.load(Ordering::SeqCst);
         loop {
             let mut current = self.manager.current.lock();
@@ -173,6 +225,14 @@ impl ManagedConnectionWalWrapper {
                     code: ErrorCode::DatabaseBusy,
                     extended_code: 517, // stale read
                 });
+            }
+            // Out of time, unless the lock has just been handed to us: then take it.
+            if give_up_at.map_or(false, |g| Instant::now() >= g)
+                && !matches!(*current, Some(Slot { id, .. }) if id == self.id)
+            {
+                self.abandon(&mut current, &cancelled);
+                warn_gave_up(enqueued_at.elapsed());
+                return Err(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY));
             }
             // If other connection is about to checkpoint - we better to immediately return.
             //
@@ -274,7 +334,7 @@ impl ManagedConnectionWalWrapper {
                                     tracing::debug!(line = line!(), "parking");
                                     // Bounded park either way: if the rollback didn't happen (owner busy
                                     // or already gone), re-evaluate shortly instead of waiting forever.
-                                    parker.park_deadline(Instant::now() + Duration::from_millis(10));
+                                    parker.park_deadline(cap(Instant::now() + Duration::from_millis(10)));
                                     tracing::debug!(line = line!(), "unparked");
                                 } else {
                                     // otherwise we wait for the txn to timeout, or to be unparked by it
@@ -282,7 +342,7 @@ impl ManagedConnectionWalWrapper {
                                         slot.started_at + self.manager.inner.txn_timeout_duration;
                                     drop(current);
                                     tracing::debug!(line = line!(), "parking");
-                                    parker.park_deadline(deadline);
+                                    parker.park_deadline(cap(deadline));
                                     tracing::debug!(
                                         line = line!(),
                                         "before_deadline?: {:?}",
@@ -311,9 +371,9 @@ impl ManagedConnectionWalWrapper {
                                 tracing::debug!(line = line!(), "parking");
                                 // Never busy-spin: once the deadline has passed,
                                 // park_deadline would return immediately.
-                                parker.park_deadline(
+                                parker.park_deadline(cap(
                                     deadline.max(Instant::now() + Duration::from_millis(10)),
-                                );
+                                ));
                                 tracing::debug!(
                                     line = line!(),
                                     "unparked after before_deadline?: {:?}",
@@ -332,7 +392,7 @@ impl ManagedConnectionWalWrapper {
                                         Some(_) => {
                                             drop(current);
                                             tracing::debug!(line = line!(), "parking");
-                                            parker.park();
+                                            park_until(&parker, give_up_at);
                                             tracing::debug!(line = line!(), "unparked");
                                         }
                                         None => {
@@ -350,7 +410,7 @@ impl ManagedConnectionWalWrapper {
                                         + self.manager.inner.acquire_timeout_duration;
                                     drop(current);
                                     tracing::debug!(line = line!(), "parking");
-                                    parker.park_deadline(deadline);
+                                    parker.park_deadline(cap(deadline));
                                     tracing::debug!(
                                         line = line!(),
                                         "unparked after before_deadline?: {:?}",
@@ -369,7 +429,7 @@ impl ManagedConnectionWalWrapper {
                     Some(_) => {
                         drop(current);
                         tracing::debug!(line = line!(), "parking");
-                        parker.park();
+                        park_until(&parker, give_up_at);
                         tracing::debug!(line = line!(), "unparked");
                     }
                     None => {
@@ -636,5 +696,68 @@ impl WrapWal<InnerWal> for ManagedConnectionWalWrapper {
         self.manager.inner.abort_handle.lock().remove(&self.id);
         tracing::debug!(id = self.id, "closed in {:?}", before.elapsed());
         ret
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn manager(max_wait: Option<Duration>) -> ConnectionManager {
+        ConnectionManager {
+            inner: Arc::new(ConnectionManagerInner {
+                write_lock_max_wait: max_wait,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn waiter_gives_up_after_max_wait_and_is_skipped() {
+        let manager = manager(Some(Duration::from_millis(50)));
+        let holder = ManagedConnectionWalWrapper::new(manager.clone());
+        holder.acquire().unwrap();
+
+        let waiter = ManagedConnectionWalWrapper::new(manager.clone());
+        let started = Instant::now();
+        let err = std::thread::spawn(move || waiter.acquire().unwrap_err())
+            .join()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::DatabaseBusy);
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+
+        // The abandoned waiter's queue entry must not get the lock: the next
+        // connection acquires it as soon as the holder releases.
+        holder.release();
+        let next = ManagedConnectionWalWrapper::new(manager.clone());
+        let started = Instant::now();
+        next.acquire().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let current = manager.current.lock();
+        assert!(matches!(*current, Some(Slot { id, .. }) if id == next.id()));
+    }
+
+    #[test]
+    fn waiter_within_max_wait_gets_the_lock() {
+        let manager = manager(Some(Duration::from_secs(5)));
+        let holder = ManagedConnectionWalWrapper::new(manager.clone());
+        holder.acquire().unwrap();
+
+        let waiter = ManagedConnectionWalWrapper::new(manager.clone());
+        let waiter_id = waiter.id();
+        let handle = std::thread::spawn(move || waiter.acquire());
+        std::thread::sleep(Duration::from_millis(50));
+        holder.release();
+        handle.join().unwrap().unwrap();
+        let current = manager.current.lock();
+        assert!(matches!(*current, Some(Slot { id, .. }) if id == waiter_id));
+    }
+
+    #[test]
+    fn no_max_wait_by_default() {
+        // Unset in the test environment: upstream behaviour, wait indefinitely.
+        assert_eq!(ConnectionManagerInner::default().write_lock_max_wait, None);
     }
 }
