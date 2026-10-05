@@ -6,6 +6,57 @@ use the upstream sqld version they are based on; the image name
 (`ghcr.io/codepilots-io/libsql-server`) tells them apart from upstream's
 builds. A further fix on the same upstream base gets the next patch version.
 
+## 0.24.34 — 2026-10-05
+
+Same upstream base as 0.24.33. Found with a new overload test
+([`codepilots/stress/overload.sh`](codepilots/stress/overload.sh)): the
+extreme client mix against a sqld capped at 1 CPU and 1 GB, so writes arrive
+faster than they can be served.
+
+### Fixed
+
+- **Server abort at 4096 threads under overload** (`428708f56`). Every
+  statement runs on a blocking thread pool that allowed 50 000 threads. Under
+  overload each writer queued for the write lock holds one, and at 4096
+  threads tracing-subscriber's registry panics in a function that cannot
+  unwind (`Thread count overflowed the configured max count`), aborting the
+  process. Stock 0.24.33 and this fork's 0.24.33 aborted on 4 of 4 overload
+  runs. The pool is now capped at 3000; further statements wait in a queue.
+
+### Added
+
+- **`SQLD_WRITE_LOCK_MAX_WAIT_MS`** (`3e58fd090`): upper bound on how long a
+  writer waits for the write lock before giving up with `SQLITE_BUSY`. Unset
+  or 0 keeps the upstream behaviour (wait indefinitely). Under sustained
+  overload the queue otherwise keeps requests whose clients disconnected long
+  ago. A writer that gives up is skipped like any other abandoned waiter;
+  give-ups are logged at `WARN` at most once every 10 s with a running count.
+
+### Recommended settings
+
+`SQLD_CHECKPOINT_INTERVAL_S` is an existing upstream option: it replaces the
+WAL auto-checkpoint after commits (each of which queues for the write lock)
+with one `TRUNCATE` checkpoint per interval. Note that the periodic checkpoint
+also runs `VACUUM` when more than half of a database of 256 MiB or more is
+free pages; check `PRAGMA freelist_count` against `PRAGMA page_count` first.
+
+Overload test, 2 × 5 min each (CI runner, sqld limited to 1 CPU / 1 GB):
+
+| Image / settings | Result | Peak threads | Writes again after load stops |
+|---|---|---|---|
+| 0.24.33, defaults | aborted 4/4 | ~4100 | — |
+| 0.24.34, defaults | ok 2/2 | ~3050 | 28–36 s |
+| 0.24.34, `SQLD_CHECKPOINT_INTERVAL_S=60`, `SQLD_WRITE_LOCK_MAX_WAIT_MS=30000` | ok 2/2 | 1200–2350 | 10–16 s |
+
+All runs, including the standard (5 × 3 min) and extreme (2 × 10 min) suites
+with and without these settings, passed the consistency checks: every
+acknowledged write present, no torn transactions.
+
+### Build
+
+- Image: `ghcr.io/codepilots-io/libsql-server:0.24.34` (linux/amd64).
+- CI: `codepilots-test.yml` runs the `connection::` unit tests on every push.
+
 ## 0.24.33 — 2026-10-04
 
 Based on upstream `f8fb14f3` (sqld 0.24.33, the source of

@@ -13,6 +13,11 @@ neither stalls nor loses or tears writes.
   Checks the counter, that every two-row transaction is all-or-nothing, and
   that acknowledged commits exist and rejected ones do not.
 
+- `overload.sh` — the extreme client mix against a sqld limited to 1 CPU and
+  1 GB, so writes arrive faster than they are served. Reports peak threads and
+  how long sqld takes to accept a write once the load stops; fails on a crash,
+  failed checks, or no recovery within 60 s.
+
 Run against any image (fresh container per run; fails on stall, crash, stale
 write-lock slot or failed checks):
 
