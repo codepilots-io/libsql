@@ -27,7 +27,7 @@ jobs:
         # test_many_concurrent is flaky upstream at the same rate with or without
         # this fork's changes (see CHANGELOG.md), so it runs separately and is
         # reported but not gating.
-        run: cargo test -p libsql-server --lib --locked connection:: -- --skip test_many_concurrent
+        run: cargo test -p libsql-server --lib --locked "connection::" -- --skip test_many_concurrent
       - name: test_many_concurrent (informational)
         continue-on-error: true
         run: cargo test -p libsql-server --lib --locked connection::connection_core::test::test_many_concurrent
