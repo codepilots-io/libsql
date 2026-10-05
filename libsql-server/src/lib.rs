@@ -97,9 +97,18 @@ const DB_CREATE_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_AUTO_CHECKPOINT: u32 = 1000;
 const LIBSQL_PAGE_SIZE: u64 = 4096;
 
+/// Every statement runs as a blocking task on `BLOCKING_RT`, so under overload
+/// (e.g. thousands of writers queued for the write lock) this pool sets the
+/// thread count. tracing-subscriber's registry (sharded-slab) supports at most
+/// 4096 threads per process and panics in a non-unwinding context beyond that,
+/// aborting sqld; 50 000 allowed that. Past this cap tasks queue in tokio
+/// instead of spawning threads. The headroom covers the main runtime (up to
+/// 512 blocking threads) and its workers.
+const MAX_BLOCKING_THREADS: usize = 3_000;
+
 pub(crate) static BLOCKING_RT: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .max_blocking_threads(50_000)
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
         .enable_all()
         .build()
         .unwrap()
