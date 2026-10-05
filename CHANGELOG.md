@@ -54,7 +54,10 @@ acknowledged write present, no torn transactions.
 
 ### Build
 
-- Image: `ghcr.io/codepilots-io/libsql-server:0.24.34` (linux/amd64).
+- Image: `ghcr.io/codepilots-io/libsql-server:0.24.34` (linux/amd64), digest
+  `sha256:627d90c7b7a9c91407bbef52d0cbaa4c536659a1bbdd9010377b17517b839406`;
+  that exact digest passed standard 5/5, extreme 2/2 and overload 2/2 with the
+  recommended settings (CI run 37351724278).
 - CI: `codepilots-test.yml` runs the `connection::` unit tests on every push.
 
 ## 0.24.33 — 2026-10-04
